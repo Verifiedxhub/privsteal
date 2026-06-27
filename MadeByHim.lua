@@ -5,13 +5,41 @@ local CONFIG = {
     PRIME_RANGE = 80,
     MIN_GENERATION = 0,
     GUI_VISIBLE = true,
-    GUI_X = nil,
-    GUI_Y = nil,
-    TOGGLE_X = nil,
-    TOGGLE_Y = nil,
+    PROGRESS_BAR_VISIBLE = true,
+    PROGRESS_BAR_X = 0,
+    PROGRESS_BAR_Y = 0,
 }
 
-local CONFIG_FILE = "PrivAutoStealConfig.json"
+-- Internal timers using Heartbeat
+local cooldownTimer = 0
+local entryDelayTimer = 0
+
+-- Save/Load functions using file-based JSON
+local function parseGenerationInput(input)
+    if not input or input == "" then return 0 end
+    input = input:lower():gsub(",", ""):gsub("%s+", "")
+    
+    local num = tonumber(input:match("[%d%.]+")) or 0
+    if input:find("b$") then
+        return num * 1000000000
+    elseif input:find("m$") then
+        return num * 1000000
+    elseif input:find("k$") then
+        return num * 1000
+    end
+    return num
+end
+
+local function formatGeneration(num)
+    if num >= 1000000000 then
+        return string.format("%.1fb", num / 1000000000)
+    elseif num >= 1000000 then
+        return string.format("%.1fm", num / 1000000)
+    elseif num >= 1000 then
+        return string.format("%.1fk", num / 1000)
+    end
+    return tostring(num)
+end
 
 local function saveConfig()
     local data = {
@@ -21,17 +49,24 @@ local function saveConfig()
         guiY = CONFIG.GUI_Y,
         toggleX = CONFIG.TOGGLE_X,
         toggleY = CONFIG.TOGGLE_Y,
-        guiVisible = CONFIG.GUI_VISIBLE,
+        progressBarX = CONFIG.PROGRESS_BAR_X,
+        progressBarY = CONFIG.PROGRESS_BAR_Y,
+        progressBarVisible = CONFIG.PROGRESS_BAR_VISIBLE,
     }
-    local json = game:GetService("HttpService"):JSONEncode(data)
-    writefile(CONFIG_FILE, json)
+    local success = pcall(function()
+        writefile("PhantomHub_Config.json", game:GetService("HttpService"):JSONEncode(data))
+    end)
 end
 
 local function loadConfig()
-    if not isfile(CONFIG_FILE) then return end
-    local success, json = pcall(readfile, CONFIG_FILE)
-    if not success or not json then return end
-    local success2, data = pcall(game:GetService("HttpService").JSONDecode, game:GetService("HttpService"), json)
+    local success, content = pcall(function()
+        return readfile("PhantomHub_Config.json")
+    end)
+    if not success or not content then return end
+    
+    local success2, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(content)
+    end)
     if success2 and data then
         if data.stealRange then CONFIG.STEAL_RANGE = data.stealRange end
         if data.minGeneration then CONFIG.MIN_GENERATION = data.minGeneration end
@@ -39,7 +74,9 @@ local function loadConfig()
         if data.guiY then CONFIG.GUI_Y = data.guiY end
         if data.toggleX then CONFIG.TOGGLE_X = data.toggleX end
         if data.toggleY then CONFIG.TOGGLE_Y = data.toggleY end
-        if data.guiVisible ~= nil then CONFIG.GUI_VISIBLE = data.guiVisible end
+        if data.progressBarX then CONFIG.PROGRESS_BAR_X = data.progressBarX end
+        if data.progressBarY then CONFIG.PROGRESS_BAR_Y = data.progressBarY end
+        if data.progressBarVisible ~= nil then CONFIG.PROGRESS_BAR_VISIBLE = data.progressBarVisible end
     end
 end
 
@@ -55,6 +92,7 @@ local S = {
 
 local Packages = S.ReplicatedStorage:WaitForChild("Packages")
 local Datas = S.ReplicatedStorage:WaitForChild("Datas")
+
 local AnimalsData = require(Datas:WaitForChild("Animals"))
 
 S.LocalPlayer = S.Players.LocalPlayer
@@ -71,7 +109,11 @@ local syncRemotes = (function()
     }
 end)()
 
-local plotAnimalSync = { caches = {}, connections = {} }
+local plotAnimalSync = {
+    caches = {},
+    connections = {},
+}
+
 local onPlotDataChanged = Instance.new("BindableEvent")
 
 local function splitSyncPath(path)
@@ -164,13 +206,11 @@ for _, child in ipairs(syncRemotes.channelFolder:GetChildren()) do
         attachPlotChannel(child)
     end
 end
-
 syncRemotes.channelFolder.ChildAdded:Connect(function(child)
     if child:IsA("RemoteEvent") then
         attachPlotChannel(child)
     end
 end)
-
 syncRemotes.routeRemote.OnClientEvent:Connect(function(actions)
     for _, action in ipairs(actions) do
         local kind, channelName = action[1], tostring(action[2])
@@ -202,17 +242,19 @@ local StealState = {
     active = false,
     startTime = 0,
     label = "",
-    generation = 0,
     lastResult = "",
     lastResultTime = 0,
     totalSteals = 0,
     failedSteals = 0,
     currentUid = nil,
-    cooldownUntil = 0,
     holdProgress = 0,
 }
 
-local pickCache = { target = nil, position = nil, valid = false }
+local pickCache = {
+    target = nil,
+    position = nil,
+    valid = false,
+}
 
 local function invalidatePickCache()
     pickCache.valid = false
@@ -240,92 +282,107 @@ local function stripRichText(s)
     return (s:gsub("<[^>]+>", ""):gsub("%s+", " "):match("^%s*(.-)%s*$"))
 end
 
-local function getText(obj)
-    if not obj then return "" end
-    local raw = ""
-    if obj:IsA("TextLabel") or obj:IsA("TextBox") or obj:IsA("TextButton") then
-        raw = obj.Text or ""
-    else
-        for _, c in ipairs(obj:GetDescendants()) do
-            if (c:IsA("TextLabel") or c:IsA("TextBox")) and c.Text ~= "" then
-                raw = c.Text
-                break
-            end
-        end
+local function parseGenText(text)
+    if not text or text == "" then return 0 end
+    local cleanText = text:gsub("[^%d.]", "")
+    local num = tonumber(cleanText)
+    if not num or num == 0 then return 0 end
+    if text:find("[Mm]") then
+        return num * 1000000
+    elseif text:find("[Bb]") then
+        return num * 1000000000
+    elseif text:find("[Kk]") then
+        return num * 1000
     end
-    return stripRichText(raw)
+    return num
 end
 
-local overheadListCache = {}
-local overheadListTime = 0
-local OVERHEAD_LIST_TTL = 0.05
+local overheadCache = {}
+local overheadCacheTime = 0
+local OVERHEAD_CACHE_TTL = 0.2
 
-local function invalidateOverheadCache()
-    overheadListTime = 0
-end
-
-local function getOverheadList()
+local function refreshOverheadCache()
     local now = tick()
-    if now - overheadListTime < OVERHEAD_LIST_TTL then
-        return overheadListCache
+    if now - overheadCacheTime < OVERHEAD_CACHE_TTL then
+        return overheadCache
     end
-    overheadListTime = now
-    overheadListCache = {}
     
-    if not debris then
-        return overheadListCache
-    end
+    overheadCache = {}
+    overheadCacheTime = now
+    
+    if not debris then return overheadCache end
     
     for _, part in ipairs(debris:GetChildren()) do
         if part.Name == "FastOverheadTemplate" and part:IsA("BasePart") then
             local overhead = part:FindFirstChild("AnimalOverhead")
-            if overhead then
-                local name = getText(overhead:FindFirstChild("DisplayName"))
-                local gen = getText(overhead:FindFirstChild("Generation"))
-                if name ~= "" and gen ~= "" then
-                    table.insert(overheadListCache, {
-                        name = name,
-                        gen = gen,
-                    })
+            if not overhead then continue end
+            
+            local displayName = ""
+            local displayNameLabel = overhead:FindFirstChild("DisplayName")
+            if displayNameLabel then
+                displayName = stripRichText(displayNameLabel.Text or "")
+            end
+            
+            local genText = ""
+            local genValue = 0
+            
+            local genLabel = overhead:FindFirstChild("Generation")
+            if genLabel then
+                genText = stripRichText(genLabel.Text or "")
+                genValue = parseGenText(genText)
+            end
+            
+            if genValue == 0 then
+                local genStroke = overhead:FindFirstChild("Generation")
+                if genStroke then
+                    for _, child in ipairs(genStroke:GetChildren()) do
+                        if child:IsA("TextLabel") then
+                            genText = stripRichText(child.Text or "")
+                            genValue = parseGenText(genText)
+                            break
+                        end
+                    end
                 end
             end
+            
+            if genValue == 0 then
+                for _, child in ipairs(overhead:GetChildren()) do
+                    if child:IsA("TextLabel") then
+                        local text = stripRichText(child.Text or "")
+                        if text:find("[%d]+[kKmMbB]") or text:match("%d+") then
+                            genText = text
+                            genValue = parseGenText(text)
+                            break
+                        end
+                    end
+                end
+            end
+            
+            local mutation = ""
+            local mutObj = overhead:FindFirstChild("Mutation")
+            if mutObj then
+                for _, child in ipairs(mutObj:GetChildren()) do
+                    if child:IsA("TextLabel") then
+                        mutation = stripRichText(child.Text or "")
+                        break
+                    end
+                end
+            end
+            
+            local pos = part.Position
+            table.insert(overheadCache, {
+                position = pos,
+                displayName = displayName,
+                generation = genValue,
+                generationText = genText,
+                mutation = mutation,
+                part = part,
+                overhead = overhead,
+            })
         end
     end
     
-    return overheadListCache
-end
-
-if debris then
-    debris.ChildAdded:Connect(invalidateOverheadCache)
-    debris.ChildRemoved:Connect(invalidateOverheadCache)
-end
-
-local function parseGenText(text)
-    if not text or text == "" then return 0 end
-    local clean = text:gsub("[%$]", ""):gsub("/s", ""):gsub("%s+", "")
-    local num = tonumber(clean:match("[%d%.]+"))
-    if not num or num == 0 then return 0 end
-    if clean:find("[Mm]") then return num * 1000000 end
-    if clean:find("[Bb]") then return num * 1000000000 end
-    if clean:find("[Kk]") then return num * 1000 end
-    return num
-end
-
-local function parseUserInput(input)
-    if not input or input == "" then return 0 end
-    input = input:lower():gsub(",", ""):gsub("%s+", "")
-    local num = tonumber(input:match("[%d%.]+")) or 0
-    if input:find("b$") then return num * 1000000000 end
-    if input:find("m$") then return num * 1000000 end
-    if input:find("k$") then return num * 1000 end
-    return num
-end
-
-local function formatNumber(num)
-    if num >= 1000000000 then return string.format("%.1fb", num / 1000000000) end
-    if num >= 1000000 then return string.format("%.1fm", num / 1000000) end
-    if num >= 1000 then return string.format("%.1fk", num / 1000) end
-    return tostring(num)
+    return overheadCache
 end
 
 local function getAnimalGeneration(animalData)
@@ -334,28 +391,50 @@ local function getAnimalGeneration(animalData)
     end
     
     local animalName = animalData.name or ""
-    if animalName == "" then
-        return 0
-    end
+    if animalName == "" then return 0 end
     
-    local list = getOverheadList()
-    if #list == 0 then
-        return 0
-    end
+    local pos = getAnimalPosition(animalData)
+    if not pos then return 0 end
     
+    local cache = refreshOverheadCache()
+    if #cache == 0 then return 0 end
+    
+    local bestMatch = nil
+    local bestDist = math.huge
     local animalNameLower = string.lower(animalName)
-    for _, entry in ipairs(list) do
-        local entryNameLower = string.lower(entry.name or "")
-        if entryNameLower == animalNameLower then
-            return parseGenText(entry.gen)
+    
+    for _, entry in ipairs(cache) do
+        local entryName = string.lower(entry.displayName or "")
+        
+        local nameMatch = false
+        if entryName ~= "" and animalNameLower ~= "" then
+            if entryName == animalNameLower then
+                nameMatch = true
+            elseif entryName:find(animalNameLower, 1, true) or animalNameLower:find(entryName, 1, true) then
+                nameMatch = true
+            end
+        end
+        
+        local dist = (entry.position - pos).Magnitude
+        
+        if nameMatch and dist < 50 and dist < bestDist then
+            bestMatch = entry
+            bestDist = dist
         end
     end
     
-    for _, entry in ipairs(list) do
-        local entryNameLower = string.lower(entry.name or "")
-        if entryNameLower:find(animalNameLower, 1, true) or animalNameLower:find(entryNameLower, 1, true) then
-            return parseGenText(entry.gen)
+    if not bestMatch then
+        for _, entry in ipairs(cache) do
+            local dist = (entry.position - pos).Magnitude
+            if dist < 15 and dist < bestDist then
+                bestMatch = entry
+                bestDist = dist
+            end
         end
+    end
+    
+    if bestMatch then
+        return bestMatch.generation
     end
     
     return 0
@@ -496,14 +575,11 @@ local function executeStealAsync(prompt, animalData, myGeneration)
     StealState.active = true
     StealState.startTime = tick()
     StealState.label = label
-    StealState.generation = getAnimalGeneration(animalData)
     StealState.currentUid = animalData.uid
     StealState.holdProgress = 0
 
     task.spawn(function()
-        for _, fn in ipairs(data.holdCallbacks) do
-            task.spawn(fn)
-        end
+        for _, fn in ipairs(data.holdCallbacks) do task.spawn(fn) end
 
         local startTime = tick()
         while true do
@@ -535,32 +611,63 @@ local function executeStealAsync(prompt, animalData, myGeneration)
             return
         end
 
-        local fired = false
-        local inRange = false
+        -- Entry delay using Heartbeat (just one frame)
+        entryDelayTimer = 0
+        while entryDelayTimer < 0.016 do
+            if myGeneration ~= StealGeneration then
+                data.ready = true
+                return
+            end
+            if not prompt.Parent then
+                data.ready = true
+                return
+            end
+            task.wait()
+        end
         
-        local rangeCheckStart = tick()
+        if myGeneration == StealGeneration and distToAnimal(animalData) <= CONFIG.STEAL_RANGE then
+            for _, fn in ipairs(data.triggerCallbacks) do task.spawn(fn) end
+            StealState.active = false
+            StealState.totalSteals = StealState.totalSteals + 1
+            StealState.lastResult = "Stole " .. label
+            StealState.lastResultTime = tick()
+            StealState.currentUid = nil
+            StealState.holdProgress = 0
+            cooldownTimer = 0
+            data.ready = true
+            return
+        end
+
+        local fired = false
         while true do
             if myGeneration ~= StealGeneration then break end
             if not prompt.Parent then break end
             
-            local dist = distToAnimal(animalData)
-            if dist <= CONFIG.STEAL_RANGE then
-                inRange = true
+            if distToAnimal(animalData) <= CONFIG.STEAL_RANGE then
+                entryDelayTimer = 0
+                while entryDelayTimer < 0.016 do
+                    if myGeneration ~= StealGeneration then
+                        data.ready = true
+                        return
+                    end
+                    if not prompt.Parent then
+                        data.ready = true
+                        return
+                    end
+                    if distToAnimal(animalData) > CONFIG.STEAL_RANGE then
+                        data.ready = true
+                        return
+                    end
+                    task.wait()
+                end
+                
+                if myGeneration == StealGeneration then
+                    for _, fn in ipairs(data.triggerCallbacks) do task.spawn(fn) end
+                    fired = true
+                end
                 break
             end
-            
-            if tick() - rangeCheckStart > 1 then
-                break
-            end
-            
             task.wait()
-        end
-        
-        if inRange and myGeneration == StealGeneration then
-            for _, fn in ipairs(data.triggerCallbacks) do
-                task.spawn(fn)
-            end
-            fired = true
         end
 
         if myGeneration == StealGeneration then
@@ -576,7 +683,7 @@ local function executeStealAsync(prompt, animalData, myGeneration)
             StealState.lastResultTime = tick()
             StealState.currentUid = nil
             StealState.holdProgress = 0
-            StealState.cooldownUntil = tick() + 0.05
+            cooldownTimer = 0
         end
 
         data.ready = true
@@ -585,7 +692,7 @@ local function executeStealAsync(prompt, animalData, myGeneration)
 end
 
 local function attemptSteal(target)
-    if tick() < StealState.cooldownUntil then
+    if cooldownTimer < 0.016 then
         return false
     end
     
@@ -595,9 +702,7 @@ local function attemptSteal(target)
 
     if not InternalStealCache[target.prompt] then
         buildStealCallbacks(target.prompt)
-        if not InternalStealCache[target.prompt] then
-            return false
-        end
+        if not InternalStealCache[target.prompt] then return false end
     end
 
     StealGeneration = StealGeneration + 1
@@ -606,79 +711,42 @@ end
 
 local function scanAllPlots()
     local newCache = {}
-    local seenUids = {}
-    
+
     for _, plot in ipairs(plots:GetChildren()) do
         local cache = getPlotChannelData(plot.Name)
         if not cache then continue end
         local animalList = cache.AnimalList
         if typeof(animalList) ~= "table" then continue end
-        
+
         for slot, animalData in pairs(animalList) do
             if type(animalData) == "table" then
                 local animalName = animalData.Index
                 local animalInfo = AnimalsData[animalName]
                 if not animalInfo then continue end
-                
+
                 local uid = plot.Name .. "_" .. tostring(slot)
-                if seenUids[uid] then continue end
-                seenUids[uid] = true
-                
                 local displayName = animalInfo.DisplayName or animalName
+
                 local entry = {
                     name = displayName,
                     plot = plot.Name,
                     slot = tostring(slot),
                     uid = uid,
+                    data = animalData,
                     prompt = nil,
                 }
-                
+
                 local prompt = findProximityPromptForAnimal(entry)
                 if prompt then
                     entry.prompt = prompt
                     buildStealCallbacks(prompt)
                 end
-                
+
                 table.insert(newCache, entry)
             end
         end
     end
-    
-    for _, plot in ipairs(plots:GetChildren()) do
-        local podiums = plot:FindFirstChild("AnimalPodiums")
-        if not podiums then continue end
-        
-        for slot, podium in pairs(podiums:GetChildren()) do
-            for _, child in ipairs(plot:GetChildren()) do
-                if child:IsA("Model") and child.Name ~= "AnimalPodiums" and child.Name ~= "PlotSign" then
-                    local root = child:FindFirstChild("RootPart") or child:FindFirstChild("FakeRootPart")
-                    if root then
-                        local uid = plot.Name .. "_" .. tostring(slot)
-                        if seenUids[uid] then break end
-                        seenUids[uid] = true
-                        
-                        local entry = {
-                            name = child.Name,
-                            plot = plot.Name,
-                            slot = tostring(slot),
-                            uid = uid,
-                            prompt = nil,
-                        }
-                        
-                        local prompt = findProximityPromptForAnimal(entry)
-                        if prompt then
-                            entry.prompt = prompt
-                            buildStealCallbacks(prompt)
-                        end
-                        
-                        table.insert(newCache, entry)
-                        break
-                    end
-                end
-            end
-        end
-    end
-    
+
     allAnimalsCache = newCache
     invalidatePickCache()
     return #allAnimalsCache
@@ -686,10 +754,15 @@ end
 
 local function startAutoSteal()
     if stealConnection then return end
-    stealConnection = S.RunService.Heartbeat:Connect(function()
+    stealConnection = S.RunService.Heartbeat:Connect(function(deltaTime)
         if not CONFIG.AUTO_STEAL_ENABLED then return end
         
-        if tick() < StealState.cooldownUntil then return end
+        cooldownTimer = math.min(cooldownTimer + deltaTime, 1)
+        entryDelayTimer = math.min(entryDelayTimer + deltaTime, 1)
+        
+        if cooldownTimer < 0.016 then
+            return
+        end
 
         local target = getCachedClosest()
         if not target then
@@ -725,120 +798,115 @@ local function stopAutoSteal()
 end
 
 -- ============================================================
--- CLEAN OCEAN THEME GUI
+-- PHANTOM HUB THEME - Dark Gray
 -- ============================================================
 
 local THEME = {
-    bg = Color3.fromRGB(8, 16, 30),
-    bg2 = Color3.fromRGB(12, 24, 42),
-    surface = Color3.fromRGB(16, 30, 50),
-    surfaceLight = Color3.fromRGB(22, 42, 70),
-    primary = Color3.fromRGB(50, 180, 255),
-    primaryDark = Color3.fromRGB(30, 140, 230),
-    primaryLight = Color3.fromRGB(120, 220, 255),
-    text = Color3.fromRGB(220, 240, 255),
-    textDim = Color3.fromRGB(150, 190, 230),
-    textBright = Color3.fromRGB(255, 255, 255),
-    success = Color3.fromRGB(80, 240, 160),
-    error = Color3.fromRGB(255, 90, 110),
-    warning = Color3.fromRGB(255, 210, 60),
-    border = Color3.fromRGB(30, 80, 140),
+    bg = Color3.fromRGB(18, 18, 22),
+    bg2 = Color3.fromRGB(26, 26, 32),
+    panel = Color3.fromRGB(32, 32, 40),
+    accent = Color3.fromRGB(170, 170, 190),
+    accent2 = Color3.fromRGB(140, 140, 165),
+    glow = Color3.fromRGB(100, 100, 130),
+    good = Color3.fromRGB(160, 190, 220),
+    bad = Color3.fromRGB(200, 140, 150),
+    warn = Color3.fromRGB(220, 190, 140),
+    text = Color3.fromRGB(235, 235, 245),
+    dim = Color3.fromRGB(150, 150, 170),
+    border = Color3.fromRGB(50, 50, 65),
 }
 
-local function corner(obj, radius)
+local function corner(p, r)
     local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, radius or 10)
-    c.Parent = obj
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = p
 end
 
-local function stroke(obj, color, thickness)
+local function stroke(p, color, t)
     local s = Instance.new("UIStroke")
     s.Color = color or THEME.border
-    s.Thickness = thickness or 1
-    s.Parent = obj
+    s.Thickness = t or 1
+    s.Transparency = 0.3
+    s.Parent = p
     return s
 end
 
-local function gradient(obj, color1, color2, rotation)
-    local g = Instance.new("UIGradient")
-    g.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, color1),
-        ColorSequenceKeypoint.new(1, color2),
-    })
-    g.Rotation = rotation or 135
-    g.Parent = obj
-    return g
-end
-
-local function createUI()
-    local existing = S.LocalPlayer.PlayerGui:FindFirstChild("PrivAutoSteal")
-    if existing then existing:Destroy() end
-
-    local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "PrivAutoSteal"
-    screenGui.ResetOnSpawn = false
-    screenGui.IgnoreGuiInset = true
-    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    screenGui.Parent = S.LocalPlayer:WaitForChild("PlayerGui")
-
+-- Improved Toggle Button
+local function createToggleButton(screenGui, card, progressBar)
     local vp = workspace.CurrentCamera.ViewportSize
+    local btnSize = 44
     
-    local CARD_WIDTH = 250
-    local CARD_HEIGHT = 155
+    local toggleBtn = Instance.new("ImageButton")
+    toggleBtn.Name = "ToggleBtn"
+    toggleBtn.Size = UDim2.new(0, btnSize, 0, btnSize)
+    toggleBtn.Position = UDim2.fromOffset(CONFIG.TOGGLE_X or (vp.X - btnSize - 15), CONFIG.TOGGLE_Y or 100)
+    toggleBtn.BackgroundColor3 = THEME.panel
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.Image = "rbxassetid://7072699412"
+    toggleBtn.ImageColor3 = THEME.accent
+    toggleBtn.ImageTransparency = 0.2
+    toggleBtn.ZIndex = 1000
+    toggleBtn.Parent = screenGui
+    corner(toggleBtn, 12)
+    stroke(toggleBtn, THEME.border, 1.5)
+
+    -- Glow ring
+    local glowRing = Instance.new("Frame")
+    glowRing.Size = UDim2.new(1, 10, 1, 10)
+    glowRing.Position = UDim2.new(0, -5, 0, -5)
+    glowRing.BackgroundColor3 = THEME.glow
+    glowRing.BackgroundTransparency = 0.9
+    glowRing.BorderSizePixel = 0
+    glowRing.ZIndex = toggleBtn.ZIndex - 1
+    glowRing.Parent = toggleBtn
+    corner(glowRing, 14)
     
-    local card = Instance.new("Frame")
-    card.Name = "Card"
-    card.Size = UDim2.new(0, CARD_WIDTH, 0, CARD_HEIGHT)
-    card.Position = UDim2.fromOffset(CONFIG.GUI_X or (vp.X / 2 - CARD_WIDTH/2), CONFIG.GUI_Y or 100)
-    card.BackgroundColor3 = THEME.bg
-    card.BorderSizePixel = 0
-    card.Parent = screenGui
-    card.Visible = CONFIG.GUI_VISIBLE
-    corner(card, 14)
-    stroke(card, THEME.primary, 1.5)
-    gradient(card, THEME.bg, THEME.bg2, 135)
-
-    local header = Instance.new("Frame")
-    header.Name = "Header"
-    header.Size = UDim2.new(1, 0, 0, 34)
-    header.BackgroundColor3 = THEME.surface
-    header.BackgroundTransparency = 0.2
-    header.BorderSizePixel = 0
-    header.Parent = card
-    corner(header, 14)
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, 0, 1, 0)
-    title.BackgroundTransparency = 1
-    title.Text = "PRIV AUTO STEAL"
-    title.TextColor3 = THEME.textBright
-    title.TextSize = 12
-    title.Font = Enum.Font.GothamBold
-    title.TextXAlignment = Enum.TextXAlignment.Center
-    title.Parent = header
-
-    local statusDot = Instance.new("Frame")
-    statusDot.Size = UDim2.new(0, 7, 0, 7)
-    statusDot.AnchorPoint = Vector2.new(1, 0.5)
-    statusDot.Position = UDim2.new(1, -12, 0.5, 0)
-    statusDot.BackgroundColor3 = THEME.success
-    statusDot.BorderSizePixel = 0
-    statusDot.Parent = header
-    corner(statusDot, 4)
+    -- Icon label (fallback if image doesn't load)
+    local iconLabel = Instance.new("TextLabel")
+    iconLabel.Size = UDim2.new(1, 0, 1, 0)
+    iconLabel.BackgroundTransparency = 1
+    iconLabel.Text = "◈"
+    iconLabel.TextColor3 = THEME.accent
+    iconLabel.TextSize = 22
+    iconLabel.Font = Enum.Font.GothamBold
+    iconLabel.ZIndex = 2
+    iconLabel.Parent = toggleBtn
 
     local dragData = { dragging = false, startPos = nil, startMouse = nil }
 
-    header.InputBegan:Connect(function(input)
+    toggleBtn.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragData.dragging = true
             dragData.startMouse = input.Position
-            dragData.startPos = card.Position
+            dragData.startPos = toggleBtn.Position
+            S.TweenService:Create(toggleBtn, TweenInfo.new(0.15), { 
+                ImageColor3 = THEME.text,
+                BackgroundColor3 = THEME.bg2 
+            }):Play()
+            S.TweenService:Create(glowRing, TweenInfo.new(0.15), { BackgroundTransparency = 0.7 }):Play()
         end
     end)
 
-    header.InputEnded:Connect(function(input)
+    toggleBtn.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragData.dragging = false
+            if dragData.dragging then
+                local delta = (input.Position - dragData.startMouse).Magnitude
+                if delta < 8 then
+                    -- Click - toggle GUI
+                    CONFIG.GUI_VISIBLE = not CONFIG.GUI_VISIBLE
+                    card.Visible = CONFIG.GUI_VISIBLE
+                    iconLabel.Text = CONFIG.GUI_VISIBLE and "◈" or "◆"
+                    iconLabel.TextColor3 = CONFIG.GUI_VISIBLE and THEME.accent or THEME.dim
+                    toggleBtn.ImageColor3 = CONFIG.GUI_VISIBLE and THEME.accent or THEME.dim
+                    saveConfig()
+                end
+                dragData.dragging = false
+                S.TweenService:Create(toggleBtn, TweenInfo.new(0.15), { 
+                    ImageColor3 = CONFIG.GUI_VISIBLE and THEME.accent or THEME.dim,
+                    BackgroundColor3 = THEME.panel 
+                }):Play()
+                S.TweenService:Create(glowRing, TweenInfo.new(0.15), { BackgroundTransparency = 0.9 }):Play()
+            end
         end
     end)
 
@@ -846,43 +914,196 @@ local function createUI()
         if not dragData.dragging then return end
         if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
             local delta = input.Position - dragData.startMouse
-            local newX = math.clamp(dragData.startPos.X.Offset + delta.X, 0, workspace.CurrentCamera.ViewportSize.X - CARD_WIDTH)
-            local newY = math.clamp(dragData.startPos.Y.Offset + delta.Y, 0, workspace.CurrentCamera.ViewportSize.Y - CARD_HEIGHT)
+            toggleBtn.Position = UDim2.fromOffset(
+                math.clamp(dragData.startPos.X.Offset + delta.X, 0, workspace.CurrentCamera.ViewportSize.X - btnSize),
+                math.clamp(dragData.startPos.Y.Offset + delta.Y, 0, workspace.CurrentCamera.ViewportSize.Y - btnSize)
+            )
+            CONFIG.TOGGLE_X = toggleBtn.Position.X.Offset
+            CONFIG.TOGGLE_Y = toggleBtn.Position.Y.Offset
+        end
+    end)
+
+    toggleBtn.MouseEnter:Connect(function()
+        S.TweenService:Create(toggleBtn, TweenInfo.new(0.2), { 
+            BackgroundColor3 = THEME.bg2,
+            ImageColor3 = THEME.text 
+        }):Play()
+        S.TweenService:Create(glowRing, TweenInfo.new(0.2), { BackgroundTransparency = 0.7 }):Play()
+        iconLabel.TextColor3 = THEME.text
+    end)
+
+    toggleBtn.MouseLeave:Connect(function()
+        local vis = CONFIG.GUI_VISIBLE
+        S.TweenService:Create(toggleBtn, TweenInfo.new(0.2), { 
+            BackgroundColor3 = THEME.panel,
+            ImageColor3 = vis and THEME.accent or THEME.dim
+        }):Play()
+        S.TweenService:Create(glowRing, TweenInfo.new(0.2), { BackgroundTransparency = 0.9 }):Play()
+        iconLabel.TextColor3 = vis and THEME.accent or THEME.dim
+    end)
+
+    -- Pulse animation
+    task.spawn(function()
+        while toggleBtn.Parent do
+            for i = 0, 1, 0.03 do
+                if not toggleBtn.Parent then break end
+                local alpha = 0.9 + 0.1 * math.sin(i * math.pi * 2)
+                glowRing.BackgroundTransparency = alpha
+                task.wait(0.03)
+            end
+        end
+    end)
+
+    return toggleBtn
+end
+
+local function createUI()
+    local existing = S.LocalPlayer.PlayerGui:FindFirstChild("PhantomHub")
+    if existing then existing:Destroy() end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "PhantomHub"
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screenGui.Parent = S.LocalPlayer:WaitForChild("PlayerGui")
+
+    local vp = workspace.CurrentCamera.ViewportSize
+    
+    -- Main GUI
+    local card = Instance.new("Frame")
+    card.Name = "Card"
+    card.Size = UDim2.new(0, 240, 0, 165)
+    card.Position = UDim2.fromOffset(CONFIG.GUI_X or (vp.X / 2 - 120), CONFIG.GUI_Y or 100)
+    card.BackgroundColor3 = THEME.bg
+    card.BorderSizePixel = 0
+    card.Parent = screenGui
+    card.Visible = CONFIG.GUI_VISIBLE
+    corner(card, 12)
+    stroke(card, THEME.border, 1.5)
+
+    -- Header
+    local header = Instance.new("Frame")
+    header.Name = "Header"
+    header.Size = UDim2.new(1, 0, 0, 38)
+    header.BackgroundColor3 = THEME.panel
+    header.BorderSizePixel = 0
+    header.Parent = card
+    corner(header, 12)
+    stroke(header, THEME.border, 1)
+    
+    -- Header bottom mask
+    local headerMask = Instance.new("Frame")
+    headerMask.BackgroundColor3 = header.BackgroundColor3
+    headerMask.BorderSizePixel = 0
+    headerMask.Size = UDim2.new(1, 0, 0, 12)
+    headerMask.Position = UDim2.new(0, 0, 1, -12)
+    headerMask.ZIndex = header.ZIndex
+    headerMask.Parent = header
+
+    -- Drag functionality
+    local dragCard = { dragging = false, startPos = nil, startMouse = nil }
+    
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragCard.dragging = true
+            dragCard.startMouse = input.Position
+            dragCard.startPos = card.Position
+        end
+    end)
+
+    header.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragCard.dragging = false
+        end
+    end)
+
+    S.UserInputService.InputChanged:Connect(function(input)
+        if not dragCard.dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            local delta = input.Position - dragCard.startMouse
+            local newX = math.clamp(dragCard.startPos.X.Offset + delta.X, 0, workspace.CurrentCamera.ViewportSize.X - 240)
+            local newY = math.clamp(dragCard.startPos.Y.Offset + delta.Y, 0, workspace.CurrentCamera.ViewportSize.Y - 165)
             card.Position = UDim2.fromOffset(newX, newY)
             CONFIG.GUI_X = newX
             CONFIG.GUI_Y = newY
         end
     end)
 
-    -- Row 1: Auto Steal toggle
+    -- Title
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 1, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "PHANTOM HUB"
+    title.TextColor3 = THEME.accent
+    title.TextSize = 16
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Center
+    title.ZIndex = 2
+    title.Parent = header
+
+    -- Header accent line
+    local accentLine = Instance.new("Frame")
+    accentLine.Size = UDim2.new(0.25, 0, 0, 2)
+    accentLine.Position = UDim2.new(0.375, 0, 1, -2)
+    accentLine.BackgroundColor3 = THEME.accent
+    accentLine.BackgroundTransparency = 0.4
+    accentLine.BorderSizePixel = 0
+    accentLine.ZIndex = 2
+    accentLine.Parent = header
+    corner(accentLine, 1)
+
+    -- Status dot
+    local statusDot = Instance.new("Frame")
+    statusDot.Size = UDim2.new(0, 7, 0, 7)
+    statusDot.AnchorPoint = Vector2.new(0, 0.5)
+    statusDot.Position = UDim2.new(0, 12, 0.5, 0)
+    statusDot.BackgroundColor3 = THEME.dim
+    statusDot.BorderSizePixel = 0
+    statusDot.ZIndex = 2
+    statusDot.Parent = header
+    corner(statusDot, 3.5)
+    stroke(statusDot, THEME.border, 0.5)
+
+    -- Divider
+    local divider = Instance.new("Frame")
+    divider.Size = UDim2.new(1, -20, 0, 1)
+    divider.Position = UDim2.new(0, 10, 0, 38)
+    divider.BackgroundColor3 = THEME.border
+    divider.BackgroundTransparency = 0.4
+    divider.BorderSizePixel = 0
+    divider.Parent = card
+
+    -- Row 1: Auto Steal
     local row1 = Instance.new("Frame")
-    row1.Size = UDim2.new(1, -20, 0, 24)
-    row1.Position = UDim2.new(0, 10, 0, 40)
+    row1.Size = UDim2.new(1, -20, 0, 28)
+    row1.Position = UDim2.new(0, 10, 0, 48)
     row1.BackgroundTransparency = 1
     row1.Parent = card
 
     local lbl1 = Instance.new("TextLabel")
-    lbl1.Size = UDim2.new(0, 90, 1, 0)
+    lbl1.Size = UDim2.new(0, 100, 1, 0)
     lbl1.BackgroundTransparency = 1
-    lbl1.Text = "Auto Steal"
+    lbl1.Text = "AUTO STEAL"
     lbl1.TextColor3 = THEME.text
     lbl1.TextSize = 11
-    lbl1.Font = Enum.Font.GothamSemibold
+    lbl1.Font = Enum.Font.GothamBold
     lbl1.TextXAlignment = Enum.TextXAlignment.Left
     lbl1.Parent = row1
 
     local tglBtn = Instance.new("TextButton")
-    tglBtn.Size = UDim2.new(0, 38, 0, 18)
-    tglBtn.Position = UDim2.new(1, -38, 0.5, -9)
+    tglBtn.Size = UDim2.new(0, 40, 0, 20)
+    tglBtn.Position = UDim2.new(1, -40, 0.5, -10)
     tglBtn.AutoButtonColor = false
     tglBtn.Text = ""
-    tglBtn.BackgroundColor3 = CONFIG.AUTO_STEAL_ENABLED and THEME.primary or Color3.fromRGB(18, 38, 65)
+    tglBtn.BackgroundColor3 = CONFIG.AUTO_STEAL_ENABLED and THEME.accent or THEME.panel
     tglBtn.Parent = row1
-    corner(tglBtn, 9)
+    corner(tglBtn, 10)
+    stroke(tglBtn, THEME.border, 1)
 
     local tglKnob = Instance.new("Frame")
-    tglKnob.Size = UDim2.new(0, 13, 0, 13)
-    tglKnob.Position = CONFIG.AUTO_STEAL_ENABLED and UDim2.new(1, -16, 0.5, -6.5) or UDim2.new(0, 3, 0.5, -6.5)
+    tglKnob.Size = UDim2.new(0, 14, 0, 14)
+    tglKnob.Position = CONFIG.AUTO_STEAL_ENABLED and UDim2.new(1, -18, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
     tglKnob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     tglKnob.BorderSizePixel = 0
     tglKnob.Parent = tglBtn
@@ -890,11 +1111,11 @@ local function createUI()
 
     local function updateToggleVisual()
         local on = CONFIG.AUTO_STEAL_ENABLED
-        S.TweenService:Create(tglKnob, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
-            Position = on and UDim2.new(1, -16, 0.5, -6.5) or UDim2.new(0, 3, 0.5, -6.5)
+        S.TweenService:Create(tglKnob, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
+            Position = on and UDim2.new(1, -18, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
         }):Play()
-        S.TweenService:Create(tglBtn, TweenInfo.new(0.15), {
-            BackgroundColor3 = on and THEME.primary or Color3.fromRGB(18, 38, 65)
+        S.TweenService:Create(tglBtn, TweenInfo.new(0.2), {
+            BackgroundColor3 = on and THEME.accent or THEME.panel
         }):Play()
     end
 
@@ -907,18 +1128,18 @@ local function createUI()
 
     -- Row 2: Radius slider
     local row2 = Instance.new("Frame")
-    row2.Size = UDim2.new(1, -20, 0, 22)
-    row2.Position = UDim2.new(0, 10, 0, 68)
+    row2.Size = UDim2.new(1, -20, 0, 28)
+    row2.Position = UDim2.new(0, 10, 0, 80)
     row2.BackgroundTransparency = 1
     row2.Parent = card
 
     local lbl2 = Instance.new("TextLabel")
-    lbl2.Size = UDim2.new(0, 50, 1, 0)
+    lbl2.Size = UDim2.new(0, 60, 1, 0)
     lbl2.BackgroundTransparency = 1
-    lbl2.Text = "Radius"
+    lbl2.Text = "RADIUS"
     lbl2.TextColor3 = THEME.text
-    lbl2.TextSize = 10
-    lbl2.Font = Enum.Font.GothamSemibold
+    lbl2.TextSize = 11
+    lbl2.Font = Enum.Font.GothamBold
     lbl2.TextXAlignment = Enum.TextXAlignment.Left
     lbl2.Parent = row2
 
@@ -927,41 +1148,39 @@ local function createUI()
     radVal.Position = UDim2.new(1, -30, 0, 0)
     radVal.BackgroundTransparency = 1
     radVal.Text = tostring(CONFIG.STEAL_RANGE)
-    radVal.TextColor3 = THEME.primaryLight
-    radVal.TextSize = 10
+    radVal.TextColor3 = THEME.accent2
+    radVal.TextSize = 11
     radVal.Font = Enum.Font.GothamBold
     radVal.TextXAlignment = Enum.TextXAlignment.Right
     radVal.Parent = row2
 
     local track = Instance.new("Frame")
-    track.Size = UDim2.new(1, -92, 0, 4)
-    track.Position = UDim2.new(0, 55, 0.5, -2)
-    track.BackgroundColor3 = Color3.fromRGB(12, 28, 50)
+    track.Size = UDim2.new(1, -100, 0, 4)
+    track.Position = UDim2.new(0, 66, 0.5, -2)
+    track.BackgroundColor3 = THEME.bg2
     track.BorderSizePixel = 0
     track.Parent = row2
-    corner(track, 2)
+    corner(track, 100)
 
     local trackFill = Instance.new("Frame")
     trackFill.Size = UDim2.new(0, 0, 1, 0)
-    trackFill.BackgroundColor3 = THEME.primary
+    trackFill.BackgroundColor3 = THEME.accent
     trackFill.BorderSizePixel = 0
     trackFill.Parent = track
-    corner(trackFill, 2)
-    gradient(trackFill, THEME.primary, THEME.primaryLight, 0)
+    corner(trackFill, 100)
 
     local knob = Instance.new("Frame")
-    knob.Size = UDim2.new(0, 10, 0, 10)
+    knob.Size = UDim2.new(0, 12, 0, 12)
     knob.AnchorPoint = Vector2.new(0.5, 0.5)
     knob.Position = UDim2.new(0, 0, 0.5, 0)
     knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     knob.BorderSizePixel = 0
     knob.Parent = track
-    corner(knob, 5)
-    stroke(knob, THEME.primary, 2)
+    corner(knob, 100)
+    stroke(knob, THEME.accent, 1.5)
 
     local function updateRadius(px)
         local maxW = track.AbsoluteSize.X
-        if maxW == 0 then return end
         local clamped = math.clamp(px, 0, maxW)
         local pct = clamped / maxW
         CONFIG.STEAL_RANGE = math.floor(5 + (pct * 95))
@@ -974,12 +1193,10 @@ local function createUI()
     task.defer(function()
         task.wait(0.1)
         local maxW = track.AbsoluteSize.X
-        if maxW > 0 then
-            local pct = (CONFIG.STEAL_RANGE - 5) / 95
-            local clamped = pct * maxW
-            trackFill.Size = UDim2.new(0, clamped, 1, 0)
-            knob.Position = UDim2.new(0, clamped, 0.5, 0)
-        end
+        local pct = (CONFIG.STEAL_RANGE - 5) / 95
+        local clamped = pct * maxW
+        trackFill.Size = UDim2.new(0, clamped, 1, 0)
+        knob.Position = UDim2.new(0, clamped, 0.5, 0)
     end)
 
     local draggingRad = false
@@ -1005,223 +1222,270 @@ local function createUI()
         end
     end)
 
-    -- Row 3: Min Generation
+    -- Row 3: Show Progress Bar Toggle
     local row3 = Instance.new("Frame")
-    row3.Size = UDim2.new(1, -20, 0, 22)
-    row3.Position = UDim2.new(0, 10, 0, 94)
+    row3.Size = UDim2.new(1, -20, 0, 28)
+    row3.Position = UDim2.new(0, 10, 0, 112)
     row3.BackgroundTransparency = 1
     row3.Parent = card
 
     local lbl3 = Instance.new("TextLabel")
-    lbl3.Size = UDim2.new(0, 50, 1, 0)
+    lbl3.Size = UDim2.new(0, 140, 1, 0)
     lbl3.BackgroundTransparency = 1
-    lbl3.Text = "Min Gen"
+    lbl3.Text = "SHOW PROGRESS BAR"
     lbl3.TextColor3 = THEME.text
-    lbl3.TextSize = 10
-    lbl3.Font = Enum.Font.GothamSemibold
+    lbl3.TextSize = 11
+    lbl3.Font = Enum.Font.GothamBold
     lbl3.TextXAlignment = Enum.TextXAlignment.Left
     lbl3.Parent = row3
 
-    local genBox = Instance.new("TextBox")
-    genBox.Size = UDim2.new(0, 80, 1, 0)
-    genBox.Position = UDim2.new(0, 55, 0, 0)
-    genBox.BackgroundColor3 = Color3.fromRGB(10, 22, 40)
-    genBox.BorderSizePixel = 0
-    genBox.Text = formatNumber(CONFIG.MIN_GENERATION)
-    genBox.TextColor3 = THEME.text
-    genBox.TextSize = 10
-    genBox.Font = Enum.Font.GothamBold
-    genBox.TextXAlignment = Enum.TextXAlignment.Center
-    genBox.PlaceholderText = "0"
-    genBox.PlaceholderColor3 = THEME.textDim
-    genBox.Parent = row3
-    corner(genBox, 4)
-    stroke(genBox, THEME.border, 1)
+    local pbTglBtn = Instance.new("TextButton")
+    pbTglBtn.Size = UDim2.new(0, 40, 0, 20)
+    pbTglBtn.Position = UDim2.new(1, -40, 0.5, -10)
+    pbTglBtn.AutoButtonColor = false
+    pbTglBtn.Text = ""
+    pbTglBtn.BackgroundColor3 = CONFIG.PROGRESS_BAR_VISIBLE and THEME.accent or THEME.panel
+    pbTglBtn.Parent = row3
+    corner(pbTglBtn, 10)
+    stroke(pbTglBtn, THEME.border, 1)
 
-    local genLabel = Instance.new("TextLabel")
-    genLabel.Size = UDim2.new(0, 18, 1, 0)
-    genLabel.Position = UDim2.new(1, -18, 0, 0)
-    genLabel.BackgroundTransparency = 1
-    genLabel.Text = "/s"
-    genLabel.TextColor3 = THEME.textDim
-    genLabel.TextSize = 9
-    genLabel.Font = Enum.Font.GothamSemibold
-    genLabel.TextXAlignment = Enum.TextXAlignment.Left
-    genLabel.Parent = row3
+    local pbTglKnob = Instance.new("Frame")
+    pbTglKnob.Size = UDim2.new(0, 14, 0, 14)
+    pbTglKnob.Position = CONFIG.PROGRESS_BAR_VISIBLE and UDim2.new(1, -18, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+    pbTglKnob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    pbTglKnob.BorderSizePixel = 0
+    pbTglKnob.Parent = pbTglBtn
+    corner(pbTglKnob, 7)
 
-    genBox.FocusLost:Connect(function(enterPressed)
-        if enterPressed then
-            local parsed = parseUserInput(genBox.Text)
-            CONFIG.MIN_GENERATION = parsed
-            genBox.Text = formatNumber(parsed)
-            invalidatePickCache()
-            saveConfig()
+    local function updateProgressToggle()
+        local on = CONFIG.PROGRESS_BAR_VISIBLE
+        S.TweenService:Create(pbTglKnob, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
+            Position = on and UDim2.new(1, -18, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+        }):Play()
+        S.TweenService:Create(pbTglBtn, TweenInfo.new(0.2), {
+            BackgroundColor3 = on and THEME.accent or THEME.panel
+        }):Play()
+        -- Show/hide the progress bar
+        if progressBar then
+            progressBar.Visible = on
         end
+    end
+
+    pbTglBtn.MouseButton1Click:Connect(function()
+        CONFIG.PROGRESS_BAR_VISIBLE = not CONFIG.PROGRESS_BAR_VISIBLE
+        updateProgressToggle()
+        saveConfig()
     end)
 
-    -- Progress bar
-    local bar = Instance.new("Frame")
-    bar.Size = UDim2.new(1, -20, 0, 24)
-    bar.Position = UDim2.new(0, 10, 0, 122)
-    bar.BackgroundColor3 = Color3.fromRGB(6, 16, 30)
-    bar.BackgroundTransparency = 0.2
-    bar.BorderSizePixel = 0
-    bar.Parent = card
-    corner(bar, 6)
-    stroke(bar, Color3.fromRGB(20, 55, 100), 1)
+    -- Footer
+    local footer = Instance.new("Frame")
+    footer.Size = UDim2.new(1, 0, 0, 2)
+    footer.Position = UDim2.new(0, 0, 1, -2)
+    footer.BackgroundColor3 = THEME.accent
+    footer.BackgroundTransparency = 0.5
+    footer.BorderSizePixel = 0
+    footer.Parent = card
+    corner(footer, 1)
 
-    local innerBar = Instance.new("Frame")
-    innerBar.Size = UDim2.new(1, -4, 1, -4)
-    innerBar.Position = UDim2.new(0, 2, 0, 2)
-    innerBar.BackgroundColor3 = Color3.fromRGB(8, 20, 38)
-    innerBar.BackgroundTransparency = 0.15
-    innerBar.BorderSizePixel = 0
-    innerBar.Parent = bar
-    corner(innerBar, 4)
-    innerBar.ClipsDescendants = true
-
-    local fill = Instance.new("Frame")
-    fill.Size = UDim2.new(0, 0, 1, 0)
-    fill.BackgroundColor3 = THEME.primary
-    fill.BorderSizePixel = 0
-    fill.Parent = innerBar
-    corner(fill, 4)
-    gradient(fill, THEME.primary, THEME.primaryLight, 0)
-
-    local statusLabel = Instance.new("TextLabel")
-    statusLabel.Size = UDim2.new(1, 0, 1, 0)
-    statusLabel.BackgroundTransparency = 1
-    statusLabel.Text = ""
-    statusLabel.TextColor3 = THEME.textBright
-    statusLabel.TextSize = 9
-    statusLabel.Font = Enum.Font.GothamBold
-    statusLabel.TextXAlignment = Enum.TextXAlignment.Center
-    statusLabel.ZIndex = 2
-    statusLabel.Parent = innerBar
-
-    -- Toggle Button
-    local toggleBtn = Instance.new("TextButton")
-    toggleBtn.Name = "ToggleBtn"
-    toggleBtn.Size = UDim2.new(0, 38, 0, 38)
-    toggleBtn.Position = UDim2.fromOffset(CONFIG.TOGGLE_X or (vp.X - 48), CONFIG.TOGGLE_Y or 60)
-    toggleBtn.BackgroundColor3 = CONFIG.GUI_VISIBLE and THEME.primary or Color3.fromRGB(12, 32, 55)
-    toggleBtn.BorderSizePixel = 0
-    toggleBtn.Text = CONFIG.GUI_VISIBLE and "◈" or "◇"
-    toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    toggleBtn.TextSize = 14
-    toggleBtn.Font = Enum.Font.GothamBold
-    toggleBtn.AutoButtonColor = false
-    toggleBtn.ZIndex = 1000
-    toggleBtn.Parent = screenGui
-    corner(toggleBtn, 10)
-    stroke(toggleBtn, THEME.primary, 1.5)
-
-    local toggleDrag = { dragging = false, startPos = nil, startMouse = nil }
-
-    toggleBtn.InputBegan:Connect(function(input)
+    -- ============================================================
+    -- PROGRESS BAR
+    -- ============================================================
+    local progressBar = Instance.new("Frame")
+    progressBar.Name = "ProgressBar"
+    progressBar.Size = UDim2.new(0, 220, 0, 28)
+    progressBar.Visible = CONFIG.PROGRESS_BAR_VISIBLE
+    
+    local defaultX = (vp.X / 2) - 110
+    local defaultY = vp.Y - 70
+    progressBar.Position = UDim2.fromOffset(
+        CONFIG.PROGRESS_BAR_X ~= 0 and CONFIG.PROGRESS_BAR_X or defaultX,
+        CONFIG.PROGRESS_BAR_Y ~= 0 and CONFIG.PROGRESS_BAR_Y or defaultY
+    )
+    progressBar.BackgroundColor3 = THEME.bg
+    progressBar.BackgroundTransparency = 0.1
+    progressBar.BorderSizePixel = 0
+    progressBar.Parent = screenGui
+    progressBar.ZIndex = 999
+    corner(progressBar, 10)
+    stroke(progressBar, THEME.border, 1)
+    
+    -- Make progress bar draggable
+    local dragPb = { dragging = false, startPos = nil, startMouse = nil }
+    
+    progressBar.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            toggleDrag.dragging = true
-            toggleDrag.startMouse = input.Position
-            toggleDrag.startPos = toggleBtn.Position
+            dragPb.dragging = true
+            dragPb.startMouse = input.Position
+            dragPb.startPos = progressBar.Position
+            S.TweenService:Create(progressBar, TweenInfo.new(0.15), { BackgroundTransparency = 0.05 }):Play()
         end
     end)
-
-    toggleBtn.InputEnded:Connect(function(input)
+    
+    progressBar.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            if toggleDrag.dragging then
-                local delta = (input.Position - toggleDrag.startMouse).Magnitude
-                if delta < 5 then
-                    CONFIG.GUI_VISIBLE = not CONFIG.GUI_VISIBLE
-                    card.Visible = CONFIG.GUI_VISIBLE
-                    toggleBtn.Text = CONFIG.GUI_VISIBLE and "◈" or "◇"
-                    toggleBtn.BackgroundColor3 = CONFIG.GUI_VISIBLE and THEME.primary or Color3.fromRGB(12, 32, 55)
-                    saveConfig()
-                end
-                toggleDrag.dragging = false
-            end
+            dragPb.dragging = false
+            S.TweenService:Create(progressBar, TweenInfo.new(0.15), { BackgroundTransparency = 0.1 }):Play()
         end
     end)
-
+    
     S.UserInputService.InputChanged:Connect(function(input)
-        if not toggleDrag.dragging then return end
+        if not dragPb.dragging then return end
         if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            local delta = input.Position - toggleDrag.startMouse
-            local btnSize = 38
-            toggleBtn.Position = UDim2.fromOffset(
-                math.clamp(toggleDrag.startPos.X.Offset + delta.X, 0, workspace.CurrentCamera.ViewportSize.X - btnSize),
-                math.clamp(toggleDrag.startPos.Y.Offset + delta.Y, 0, workspace.CurrentCamera.ViewportSize.Y - btnSize)
-            )
-            CONFIG.TOGGLE_X = toggleBtn.Position.X.Offset
-            CONFIG.TOGGLE_Y = toggleBtn.Position.Y.Offset
+            local delta = input.Position - dragPb.startMouse
+            local newX = math.clamp(dragPb.startPos.X.Offset + delta.X, 0, workspace.CurrentCamera.ViewportSize.X - 220)
+            local newY = math.clamp(dragPb.startPos.Y.Offset + delta.Y, 30, workspace.CurrentCamera.ViewportSize.Y - 35)
+            progressBar.Position = UDim2.fromOffset(newX, newY)
+            CONFIG.PROGRESS_BAR_X = newX
+            CONFIG.PROGRESS_BAR_Y = newY
         end
     end)
-
-    toggleBtn.MouseEnter:Connect(function()
-        S.TweenService:Create(toggleBtn, TweenInfo.new(0.15), {
-            Size = UDim2.new(0, 42, 0, 42)
-        }):Play()
-    end)
-
-    toggleBtn.MouseLeave:Connect(function()
-        S.TweenService:Create(toggleBtn, TweenInfo.new(0.15), {
-            Size = UDim2.new(0, 38, 0, 38)
-        }):Play()
-    end)
-
-    -- UI Updates
-    local lastFillPct = 0
-
+    
+    -- Inner fill
+    local pbInner = Instance.new("Frame")
+    pbInner.Size = UDim2.new(1, -8, 1, -6)
+    pbInner.Position = UDim2.new(0, 4, 0, 3)
+    pbInner.BackgroundColor3 = THEME.bg2
+    pbInner.BackgroundTransparency = 0.1
+    pbInner.BorderSizePixel = 0
+    pbInner.Parent = progressBar
+    corner(pbInner, 8)
+    pbInner.ClipsDescendants = true
+    
+    local pbFill = Instance.new("Frame")
+    pbFill.Size = UDim2.new(0, 0, 1, 0)
+    pbFill.BackgroundColor3 = THEME.accent
+    pbFill.BorderSizePixel = 0
+    pbFill.Parent = pbInner
+    corner(pbFill, 8)
+    
+    local pbFillGrad = Instance.new("UIGradient")
+    pbFillGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(1, THEME.accent2),
+    })
+    pbFillGrad.Parent = pbFill
+    
+    local pbSheen = Instance.new("Frame")
+    pbSheen.Size = UDim2.new(0, 30, 1, 0)
+    pbSheen.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    pbSheen.BackgroundTransparency = 0.85
+    pbSheen.BorderSizePixel = 0
+    pbSheen.ZIndex = 2
+    pbSheen.Parent = pbFill
+    corner(pbSheen, 8)
+    local pbSheenGrad = Instance.new("UIGradient")
+    pbSheenGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.5, 0.4),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    pbSheenGrad.Parent = pbSheen
+    
+    local pbDot = Instance.new("Frame")
+    pbDot.Size = UDim2.new(0, 5, 0, 5)
+    pbDot.AnchorPoint = Vector2.new(0, 0.5)
+    pbDot.Position = UDim2.new(0, 6, 0.5, 0)
+    pbDot.BackgroundColor3 = THEME.dim
+    pbDot.BorderSizePixel = 0
+    pbDot.ZIndex = 3
+    pbDot.Parent = pbInner
+    corner(pbDot, 2.5)
+    
+    local pbLabel = Instance.new("TextLabel")
+    pbLabel.Size = UDim2.new(1, -25, 1, 0)
+    pbLabel.Position = UDim2.new(0, 15, 0, 0)
+    pbLabel.BackgroundTransparency = 1
+    pbLabel.Text = ""
+    pbLabel.TextColor3 = THEME.text
+    pbLabel.TextSize = 10
+    pbLabel.Font = Enum.Font.GothamBold
+    pbLabel.TextXAlignment = Enum.TextXAlignment.Center
+    pbLabel.ZIndex = 3
+    pbLabel.Parent = pbInner
+    
+    -- Create toggle button
+    createToggleButton(screenGui, card, progressBar)
+    
+    -- Animation
+    local pbLastFillPct = 0
+    local pbSheenT = 0
+    
     S.RunService.RenderStepped:Connect(function(dt)
         local on = CONFIG.AUTO_STEAL_ENABLED
         local active = StealState.active
         local justFinished = StealState.lastResultTime > 0 and (tick() - StealState.lastResultTime) < 1.1
         local success = justFinished and string.find(StealState.lastResult, "Stole") ~= nil
-
-        local targetPct
+        
+        -- Update status dot
+        local dotTarget
+        if active then
+            dotTarget = THEME.warn
+        elseif justFinished then
+            dotTarget = success and THEME.good or THEME.bad
+        elseif on then
+            dotTarget = THEME.accent
+        else
+            dotTarget = THEME.dim
+        end
+        statusDot.BackgroundColor3 = statusDot.BackgroundColor3:Lerp(dotTarget, math.min(dt * 10, 1))
+        
+        -- Update progress bar dot
+        local pbDotTarget
+        if active then
+            pbDotTarget = THEME.warn
+        elseif justFinished then
+            pbDotTarget = success and THEME.good or THEME.bad
+        elseif on then
+            pbDotTarget = THEME.accent2
+        else
+            pbDotTarget = THEME.dim
+        end
+        pbDot.BackgroundColor3 = pbDot.BackgroundColor3:Lerp(pbDotTarget, math.min(dt * 9, 1))
+        
+        -- Update fill
+        local targetPct, targetColor
         if active then
             targetPct = StealState.holdProgress
+            targetColor = THEME.warn
         elseif justFinished then
             targetPct = 1
+            targetColor = success and THEME.good or THEME.bad
         else
             targetPct = 0
+            targetColor = THEME.accent
         end
-
+        
         local smoothing = active and dt * 16 or dt * 10
-        lastFillPct = lastFillPct + (targetPct - lastFillPct) * math.min(smoothing, 1)
-        fill.Size = UDim2.new(math.clamp(lastFillPct, 0, 1), 0, 1, 0)
-
-        local dotColor
+        pbLastFillPct = pbLastFillPct + (targetPct - pbLastFillPct) * math.min(smoothing, 1)
+        pbFill.Size = UDim2.new(math.clamp(pbLastFillPct, 0, 1), 0, 1, 0)
+        pbFill.BackgroundColor3 = pbFill.BackgroundColor3:Lerp(targetColor, math.min(dt * 9, 1))
+        
+        -- Sheen animation
         if active then
-            dotColor = THEME.warning
-        elseif justFinished then
-            dotColor = success and THEME.success or THEME.error
-        elseif on then
-            dotColor = THEME.success
-        else
-            dotColor = THEME.textDim
+            pbSheenT = (pbSheenT + dt * 0.6) % 1.4
+            local barWidth = pbInner.AbsoluteSize.X
+            pbSheen.Position = UDim2.new(0, -30 + (pbSheenT * (barWidth + 60)), 0, 0)
         end
-        statusDot.BackgroundColor3 = dotColor
-
+        
+        -- Update label
         if active then
-            local pct = math.floor(lastFillPct * 100)
-            local genText = formatNumber(StealState.generation)
-            statusLabel.Text = string.upper(StealState.label) .. "  " .. pct .. "%  " .. genText .. "/s"
-            statusLabel.TextColor3 = THEME.textBright
-            fill.BackgroundColor3 = THEME.primary
+            pbLabel.Text = "◈ " .. string.upper(StealState.label) .. " ◈"
+            pbLabel.TextColor3 = THEME.text
+            pbLabel.TextTransparency = 0
         elseif justFinished then
-            statusLabel.Text = string.upper(StealState.lastResult)
-            statusLabel.TextColor3 = success and THEME.success or THEME.error
-            fill.BackgroundColor3 = success and THEME.success or THEME.error
+            pbLabel.Text = "◆ " .. string.upper(StealState.lastResult) .. " ◆"
+            pbLabel.TextColor3 = success and THEME.good or THEME.bad
+            pbLabel.TextTransparency = 0
         else
-            statusLabel.Text = on and "READY  " .. formatNumber(CONFIG.MIN_GENERATION) .. "/s" or ""
-            statusLabel.TextColor3 = THEME.textDim
-            fill.BackgroundColor3 = THEME.primary
+            pbLabel.Text = "PHANTOM HUB"
+            pbLabel.TextColor3 = THEME.dim
+            pbLabel.TextTransparency = 0.3
         end
     end)
 end
 
 -- ============================================================
--- BOOT
+-- Boot
 -- ============================================================
 
 onPlotDataChanged.Event:Connect(function()
@@ -1234,6 +1498,4 @@ end)
 
 createUI()
 scanAllPlots()
-if CONFIG.AUTO_STEAL_ENABLED then
-    startAutoSteal()
-end
+if CONFIG.AUTO_STEAL_ENABLED then startAutoSteal() end
